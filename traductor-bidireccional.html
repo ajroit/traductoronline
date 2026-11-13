@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Traductor en vivo EN → ES</title>
+<style>
+  :root { --es: 34px; --en: 18px; }
+  body { margin:0; font-family:-apple-system,system-ui,sans-serif; background:#111; color:#eee; display:flex; flex-direction:column; height:100vh; }
+  header { padding:10px 14px; background:#222; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  button { font-size:16px; padding:8px 16px; border:0; border-radius:8px; background:#1a73e8; color:#fff; cursor:pointer; }
+  button.stop { background:#d93025; } button.sec { background:#444; }
+  #estado { font-size:13px; color:#aaa; flex:1; min-width:200px; }
+  #log { flex:1; overflow-y:auto; padding:16px 22px; }
+  .par { margin-bottom:18px; }
+  .es { font-size:var(--es); line-height:1.25; color:#fff; font-weight:600; }
+  .en { font-size:var(--en); color:#8ab4f8; margin-top:4px; }
+  .vivo .es, .vivo .en { opacity:.65; }
+  /* tema claro */
+  body.claro { background:#fafafa; color:#222; }
+  body.claro header { background:#e8eaed; }
+  body.claro button.sec { background:#dadce0; color:#202124; }
+  body.claro #estado { color:#5f6368; }
+  body.claro .es { color:#111; }
+  body.claro .en { color:#1a56b0; }
+</style>
+</head>
+<body>
+<header>
+  <button id="btn">Iniciar</button>
+  <button class="sec" id="mas">A+</button>
+  <button class="sec" id="menos">A−</button>
+  <button class="sec" id="cpEn">Copiar inglés</button>
+  <button class="sec" id="cpEs">Copiar español</button>
+  <button class="sec" id="limpiar">Limpiar</button>
+  <button class="sec" id="tema">Tema claro</button>
+  <button class="sec" id="dir">EN → ES</button>
+  <span id="estado">Listo. Pulsa Iniciar y acepta el permiso del micrófono.</span>
+</header>
+<div id="log"></div>
+<script>
+const $ = id => document.getElementById(id);
+const log = $('log'), estado = $('estado'), btn = $('btn');
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null, activo = false, translator = null, size = 34;
+let vivoDiv = null, ultimoTrad = 0, ultimoTexto = '';
+let historial = []; // todo lo confirmado: {en, es}, no se borra al rotar la pantalla
+
+if (!SR) estado.textContent = 'Este navegador no soporta reconocimiento de voz. Usa Chrome.';
+
+// Dirección: 'en-es' (habla inglés → ver español) o 'es-en' (habla español → ver inglés)
+let dir = 'en-es';
+const traductores = {}; // uno por dirección, para no volver a crearlos
+const LANG_VOZ = { en: 'en-US', es: 'es-AR' };
+const NOMBRE = { en: 'inglés', es: 'español' };
+
+async function prepararTraductor() {
+  const [src, dst] = dir.split('-');
+  if (traductores[dir]) return 'integrado';
+  if ('Translator' in self) {
+    try {
+      const av = await Translator.availability({ sourceLanguage: src, targetLanguage: dst });
+      if (av !== 'unavailable') {
+        estado.textContent = 'Preparando traductor' + (av === 'available' ? '…' : ' (descargando modelo, solo la primera vez)…');
+        traductores[dir] = await Translator.create({
+          sourceLanguage: src, targetLanguage: dst,
+          monitor(m) { m.addEventListener('downloadprogress', e => estado.textContent = 'Descargando traductor: ' + Math.round(e.loaded * 100) + '%'); }
+        });
+        return 'integrado';
+      }
+    } catch (e) { console.warn(e); }
+  }
+  return 'respaldo';
+}
+
+async function traducir(texto, d = dir) {
+  if (!texto.trim()) return '';
+  try {
+    if (traductores[d]) return await traductores[d].translate(texto);
+    const r = await fetch('https://api.mymemory.translated.net/get?q=' + encodeURIComponent(texto) + '&langpair=' + d.replace('-', '|'));
+    const j = await r.json();
+    return j.responseData.translatedText;
+  } catch (e) { return '(error de traducción)'; }
+}
+
+function nuevoPar(vivo) {
+  const d = document.createElement('div');
+  d.className = 'par' + (vivo ? ' vivo' : '');
+  d.innerHTML = '<div class="es"></div><div class="en"></div>';
+  log.appendChild(d);
+  return d;
+}
+function bajar() { log.scrollTop = log.scrollHeight; }
+
+async function mostrarVivo(texto) {
+  if (!vivoDiv) vivoDiv = nuevoPar(true);
+  vivoDiv.querySelector('.en').textContent = texto;
+  const ahora = Date.now();
+  if (ahora - ultimoTrad > 900 && texto !== ultimoTexto) {
+    ultimoTrad = ahora; ultimoTexto = texto;
+    const es = await traducir(texto);
+    if (vivoDiv) vivoDiv.querySelector('.es').textContent = es;
+  }
+  bajar();
+}
+async function fijar(texto) {
+  const d = vivoDiv || nuevoPar(false);
+  vivoDiv = null; ultimoTexto = '';
+  d.classList.remove('vivo');
+  d.querySelector('.en').textContent = texto;
+  const dirAqui = dir, [src, dst] = dir.split('-');
+  const entrada = { en: '', es: '', t: Date.now() };
+  entrada[src] = texto;
+  historial.push(entrada); // se guarda ya, en orden, aunque la traducción tarde
+  entrada[dst] = await traducir(texto, dirAqui);
+  d.querySelector('.es').textContent = entrada[dst];
+  while (log.children.length > 60) log.removeChild(log.firstChild);
+  bajar();
+}
+
+function crearReconocedor() {
+  const r = new SR();
+  r.lang = LANG_VOZ[dir.split('-')[0]]; r.continuous = true; r.interimResults = true;
+  r.onresult = ev => {
+    let interino = '';
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      const t = ev.results[i][0].transcript;
+      if (ev.results[i].isFinal) fijar(t.trim()); else interino += t;
+    }
+    if (interino) mostrarVivo(interino.trim());
+  };
+  r.onerror = ev => { if (ev.error !== 'no-speech' && ev.error !== 'aborted') estado.textContent = 'Error: ' + ev.error; };
+  r.onend = () => { if (activo) { try { r.start(); } catch (e) { setTimeout(() => activo && crearYArrancar(), 400); } } };
+  return r;
+}
+function crearYArrancar() { rec = crearReconocedor(); try { rec.start(); } catch (e) {} }
+
+async function iniciar() {
+  if (!SR) return;
+  btn.disabled = true;
+  const modo = await prepararTraductor();
+  btn.disabled = false;
+  activo = true; crearYArrancar();
+  estado.textContent = 'Escuchando (' + NOMBRE[dir.split('-')[0]] + ')… traducción: ' + modo;
+  btn.textContent = 'Detener'; btn.className = 'stop';
+}
+function detener() {
+  activo = false; try { rec && rec.stop(); } catch (e) {}
+  estado.textContent = 'Detenido';
+  btn.textContent = 'Iniciar'; btn.className = '';
+}
+btn.onclick = () => activo ? detener() : iniciar();
+$('mas').onclick = () => { size = Math.min(80, size + 4); document.documentElement.style.setProperty('--es', size + 'px'); document.documentElement.style.setProperty('--en', Math.round(size * .55) + 'px'); };
+$('menos').onclick = () => { size = Math.max(16, size - 4); document.documentElement.style.setProperty('--es', size + 'px'); document.documentElement.style.setProperty('--en', Math.round(size * .55) + 'px'); };
+// Cambiar dirección EN→ES / ES→EN (si está escuchando, se reinicia solo con la nueva)
+$('dir').onclick = async () => {
+  const estabaActivo = activo;
+  if (estabaActivo) detener();
+  dir = dir === 'en-es' ? 'es-en' : 'en-es';
+  $('dir').textContent = dir === 'en-es' ? 'EN → ES' : 'ES → EN';
+  vivoDiv = null; ultimoTexto = '';
+  if (estabaActivo) await iniciar();
+  else estado.textContent = 'Dirección: habla ' + NOMBRE[dir.split('-')[0]] + ', ves ' + NOMBRE[dir.split('-')[1]] + '. Pulsa Iniciar.';
+};
+
+// Tema claro/oscuro (se recuerda entre visitas si el navegador lo permite)
+function aplicarTema(claro) {
+  document.body.classList.toggle('claro', claro);
+  $('tema').textContent = claro ? 'Tema oscuro' : 'Tema claro';
+  try { localStorage.setItem('tema', claro ? 'claro' : 'oscuro'); } catch (e) {}
+}
+$('tema').onclick = () => aplicarTema(!document.body.classList.contains('claro'));
+try { if (localStorage.getItem('tema') === 'claro') aplicarTema(true); } catch (e) {}
+
+// Agrupa frases en párrafos: nuevo párrafo tras una pausa larga (cambio de orador/tema)
+// o cuando el párrafo ya es largo. Entre párrafos queda una línea en blanco.
+const PAUSA_MS = 4000, MAX_FRASES = 6, MAX_CHARS = 700;
+function armarParrafos(campo) {
+  const parrafos = []; let actual = [], largo = 0, ultimoT = 0;
+  for (const h of historial) {
+    const frase = (h[campo] || '').trim();
+    if (!frase) continue;
+    const corta = actual.length && (h.t - ultimoT > PAUSA_MS || actual.length >= MAX_FRASES || largo > MAX_CHARS);
+    if (corta) { parrafos.push(actual.join(' ')); actual = []; largo = 0; }
+    actual.push(frase); largo += frase.length; ultimoT = h.t;
+  }
+  if (actual.length) parrafos.push(actual.join(' '));
+  return parrafos.join('\n\n');
+}
+
+async function copiar(campo, boton, nombre) {
+  const texto = armarParrafos(campo);
+  if (!texto) { boton.textContent = 'Nada para copiar'; setTimeout(() => boton.textContent = nombre, 1500); return; }
+  try {
+    await navigator.clipboard.writeText(texto);
+    boton.textContent = '¡Copiado! (' + historial.length + ' frases)';
+  } catch (e) {
+    // respaldo si el portapapeles está bloqueado
+    const ta = document.createElement('textarea'); ta.value = texto; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy'); ta.remove();
+    boton.textContent = '¡Copiado!';
+  }
+  setTimeout(() => boton.textContent = nombre, 2000);
+}
+$('cpEn').onclick = e => copiar('en', e.target, 'Copiar inglés');
+$('cpEs').onclick = e => copiar('es', e.target, 'Copiar español');
+$('limpiar').onclick = () => {
+  if (historial.length && !confirm('Esto borra también lo guardado para copiar. ¿Seguro?')) return;
+  log.innerHTML = ''; vivoDiv = null; historial = [];
+};
+</script>
+</body>
+</html>
